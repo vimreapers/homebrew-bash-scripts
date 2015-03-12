@@ -1,6 +1,6 @@
 require 'formula'
 
-class iusinstaller
+class iusinstaller < Formula
   homepage 'http://github.com/vimreapers'
   head 'https://github.com/vimreapers/homebrew-shell.git'
 
