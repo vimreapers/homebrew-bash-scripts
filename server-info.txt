@@ -1,0 +1,495 @@
+#!/bin/bash
+# Copyright 2013-2014 Rackspace
+# 20131210 Chris Novoa
+SCRVERSION="1.1.1-20140408"
+
+#bash -i <(curl -sS http://pub.rackerspace.com/scripts/serverinf)
+
+
+#TODO: 
+#Fix for debian systems 
+
+
+#BIGDATE="$(date +"%a, %B %e %Y   (W:%W/D:%j)      %r %Z(%z)")"
+BIGDATE="$(date +"%a %B %e, %Y   %r (%R:%S)   %Z (%z)")"
+TZSTR=$([ -f /etc/sysconfig/clock ] && grep -Po '(?<=")[^"]+(?=")' /etc/sysconfig/clock)
+EXTIP="$(curl -s rackerr.com | sed 's/\s//g')"
+
+hr () { echo '';colorize "$1" <<< "$(eval printf %.0s${2} '{1..'"${COLUMNS:-$(tput cols)}"\})";echo ''; }
+################# Supporting functionality
+BB=$1
+if [ ! -z "$BB" ] ; then 
+	BBOLD0="[b]" && BBOLD1="[/b]"
+	BITLC0="[i]" && BITLC1="[/i]"
+	BUNDR0="[u]" && BUNDR1="[/u]"
+	BSTRK0="[s]" && BSTRK1="[/s]"
+	BBURL0="[url]" && BBURL1="[/url]"
+	BCOLRED0="[color=#993333]" && BCOLRED1="[/color]"
+	BCOLGRN0="[color=#669900]" && BCOLGRN1="[/color]"
+	BCOLBLU0="[color=#006699]" && BCOLBLU1="[/color]"
+	BCOLBRN0="[color=#996633]" && BCOLBRN1="[/color]"
+	BCODE0="[code]" && BCODE1="[/code]"
+fi
+colorize () { 
+	local B='0;'; local C=0
+	IFS='%'
+	local ARGS=$@; local STR=""
+	while (($#)); do 
+		case "$1" in
+		bb|bld)	B='1;' ;;
+		w)	 C=37 ;; #white
+		gy)	 C=40 ;; #gray
+		b)	 C=34 ;; #blue
+		p|m) C=35 ;; #purple/magenta
+		r)	 C=31 ;; #red
+		y) 	 C=33 ;; #yellow
+		g) 	 C=32 ;; #green
+		c|t) C=36 ;; #cyan
+		n)	N="-n" ;;
+		0|r|reset) C=0 ;;
+		*)	 STR="$STR $1" ;; #concatenate unexpected input... THIS IS A HACK and trims preceding/trailing whitespace
+		esac
+		shift
+	done
+	#pipe (0) or stdin (88) OR function call (concatenated)
+	[ "$(\stat -L -c %t /dev/fd/0)" == 0 ] && \echo -e $N "\033[${B}${C}m$(\cat)\033[00m" || \echo -e $N "\033[${B}${C}m$STR\033[00m"
+	unset IFS
+}
+c () { colorize $@; }
+print () { colorize $@; }
+
+################
+
+h1 () { colorize bb c <<< "$BBOLD0=====  $1 ======================$BBOLD1"; }
+h2 () { colorize bb c <<< "$BBOLD0===  $1 ======================$BBOLD1"; }
+h3 () { colorize bb c <<< "$BBOLD0== $1 ======================$BBOLD1"; }
+function HWARN { CURWARN="$(colorize r bb <<< "$BCOLRED0[WARNING] $1$BCOLRED1")"; echo -e "$CURWARN" | tee -a "$WARNINGS"; }
+function HNOTE { CURNOTE="$(colorize y bb <<< "[NOTICE] $1")"; echo -e "$CURNOTE" | tee -a "$NOTICES"; }
+HOK () { CUROK="$(colorize g <<< "[OK] $1")"; OKS="$OKS\n$CUROK"; echo -ne "$CUROK"; }
+
+
+[ $(id -u) != 0 ] && echo -e "\n\n\n\n$(c r <<< "YOU ARE NOT ROOT!!!")\n\n\n" && exit 1 
+
+
+#add to the log of servers for auditing
+#[ -f /root/.rackspace/server_number ] && DID="$SN" && curl -A "CURL-Device:$DID" -sS "http://rackerspace.com/security.php?did=$DID&host=$HOSTNAME" || curl -sS "http://rackerspace.com/security.php?host=$HOSTNAME"
+
+#System details
+ip () {
+        case $(uname) in
+           Linux) INTIP=$(ifconfig  | grep 'inet addr:'| grep -v '127.0.0.1' | cut -d: -f2 | awk '{ print $1}');;
+           FreeBSD|OpenBSD|Darwin) INTIP=$(ifconfig  | grep -E 'inet.[0-9]' | grep -v '127.0.0.1' | awk '{ print $2}') ;;
+           SunOS) INTIP=$(ifconfig -a | grep inet | grep -v '127.0.0.1' | awk '{ print $2} ') ;;
+           *) INTIP="Unknown";;
+        esac
+}
+
+varsysinf() {
+	WL="$(w -hs)"
+	WLC=$(wc -l <<< "$WL")
+	NSPLNT="$(netstat -plnt)"
+	#SSPLNT="$(ss -plnt)"
+
+	[ -f /etc/redhat-release ] && RHREL="$(< /etc/redhat-release)" && RHVERSMAJ="$(sed -rn 's/.*([56])\..*$/\1/p' <<< $RHREL)" && RHVERSMIN="$(sed -rn 's/.*\.([0-9]+).*$/\1/p' <<< $RHREL)" && RHVERS="$(sed -rn 's/.*([0-9]\.[0-9]).*$/\1/p' <<< $RHREL)"
+#sed -rn 's/.*([56]\.[2-9]{1}).*/\1/p' <<< $(rpm -q --whatprovides /etc/redhat-release)
+	DISTRO="$(grep -iE "red hat|sles|centos" <<< $RHREL)"
+	
+	HOSTNAME="$(hostname)"
+
+	DC=$(cat /root/.rackspace/datacenter 2> /dev/null)
+	DID=$(cat /root/.rackspace/server_number 2> /dev/null)
+}
+varrpmqa () { 
+	[ -z $RPMQA ] && RPMQA="$(rpm -qa --nosignature --nodigest)"; 
+}
+
+connct () {
+	case $1 in
+	http)
+		NSPLNT=$(netstat -plant | grep -E ':80 |:443 ' | grep -v "LISTEN") && echo -e "Total connections (HTTP/S):   $(wc -l <<< "$NSPLNT")" && [ -z "$2" ] && echo -e "\nConnection counts: "&& awk '{print $5}' <<< "$NSPLNT" | sed 's/::ffff://' | sed 's/:\w*$//' | sort | uniq -c | sort -rn
+		#| awk '{print $2}' | grep 1  | while read ips; do whois ${ips} | grep -i country ; done
+		
+		#get /16 counts
+		NSPLNT_CIDR16_CT=$(awk '{print $5}' <<< "$NSPLNT" | sed 's/::ffff://' | sed 's/:\w*$//' | awk -F. '{print $1"."$2}' | sort | uniq -c | sort -rn)
+		NSPLNT_CIDR16=$(awk '{print $5}' <<< "$NSPLNT" | sed 's/::ffff://' | sed 's/:\w*$//' | awk -F. '{print $1"."$2".0.0"}' | sort -u)
+		#get /16 with country
+		#NSPLNT_CIDR16_GEO=$(for ips in $NSPLNT_CIDR16; do  echo -e "$ips\t\t$(whois ${ips} | grep -m1 -i country | sed -rn 's/[cC]ountry.*:\s*([a-zA-Z]{2}})/\1/p')" ; done | sort -k2)
+
+		
+		#host $IP | cut -d" " -f5 #130.82.249.66.in-addr.arpa domain name pointer google-proxy-66-249-82-130.google.com.
+
+	;;
+	ssh)
+		NSPLNT=$(netstat -plant | grep -E ':22 ') && echo -e "Total connections (SSH):   $(wc -l <<< "$NSPLNT")" && [ -z "$2" ] && echo -e "\nConnection counts: "&& awk '{print $5}' <<< "$NSPLNT" | sed 's/::ffff://' | sed 's/:\w*$//' | sort | uniq -c | sort -rn
+	;;
+	mysql)
+		NSPLNT=$(netstat -plant | grep -E ':3306 ') && echo -e "Total connections (MySQL):   $(wc -l <<< "$NSPLNT")" && [ -z "$2" ] && echo -e "\nConnection counts: "&& awk '{print $5}' <<< "$NSPLNT" | sed 's/::ffff://' | sed 's/:\w*$//' | sort | uniq -c | sort -rn
+	;;
+	*)
+		NSPLNT=$(netstat -plant | grep -E ":$1 ") && echo -e "Total connections (:$1):   $(wc -l <<< "$NSPLNT")" && [ -z "$2" ] && echo -e "\nConnection counts: " && awk '{print $5}' <<< "$NSPLNT" | sed 's/::ffff://' | sed 's/:\w*$//' | sort | uniq -c | sort -rn
+	;;
+	esac
+}
+
+		#NSPLNT=$(grep -E ":1521 " rs-sysmon/netstat.log_backup_2014-04-25_12:36:46) && echo -e "Total connections (:$1):   $(wc -l <<< "$NSPLNT")" && [ -z "$2" ] && echo -e "\nConnection counts: " && awk '{print $5}' <<< "$NSPLNT" | sed 's/::ffff://' | sed 's/:\w*$//' | sort | uniq -c | sort -rn
+
+
+
+
+serverinf() {
+	ip
+	varsysinf
+	
+	#GET BASIC DETAILS
+	PRIMIP="$(head -1 <<< "$INTIP")"
+	[[ "$EXTIP" != "$PRIMIP" ]] && PRIMIP="$PRIMIP <=> $EXTIP" || PRIMIP="$PRIMIP"
+	[ ! -z "$DID" ] && COREDEVICE="$DID($DC)"
+	echo "$(c b <<< "Device:") $COREDEVICE $HOSTNAME / $PRIMIP"
+	echo -e "$(c b <<< "Logins:") $WLC (root: $(grep -c root <<< "$WL"), rack: $(grep -c rack <<< "$WL"), users: $(grep -cvE "rack|root" <<< "$WL"))"
+	echo -ne "\n$(c g <<< "$BIGDATE ($TZSTR)")\n   $(uptime | sed 's/load average/ld avg/') \n   $(head -1 /etc/issue | sed -r 's/\\[a-z]+//g' | c g) ($(uname -rmio))\n" 
+
+	#CHECK CPs - Plesk (login url) / cPanel (version/ports) / Webmin (user/port)
+	if [ $(service psa status 2> /dev/null | grep -o run) ]; then 
+		echo -e "\n   $(c y <<< "Plesk ($(< /usr/local/psa/version)) is running.")"
+		#echo -ne "---\nPlesk Admin Password: ";
+		#PSAPASS1="$(/usr/local/psa/bin/admin --show-password 2> /dev/null || cat /etc/psa/.psa.shadow)";
+		#PSAPASS2="$(cat /etc/psa/.psa.shadow)";
+		#URLENCODEDPSAPASS="$(php -nr 'echo urlencode('"'"$PSAPASS1"'"');')";
+
+
+		PSAPASS1="$(/usr/local/psa/bin/admin --show-password 2> /dev/null || cat /etc/psa/.psa.shadow)";
+		PSAPASS2=$(cat /etc/psa/.psa.shadow);
+		URLENCODEDPSAPASS=$(php -nr 'echo urlencode("'$PSAPASS1'");')
+		[[ "$PSAPASS1" != "$PSAPASS2" ]] && PSAPASS=$PSAPASS2 || PSAPASS=$PSAPASS1;
+
+		echo -e "    https://$EXTIP:8443/login_up.php3?login_name=admin&passwd=$URLENCODEDPSAPASS&login_locale=default&previous_page=index";
+		echo -e "\n    Users logged in to Plesk: $(mysql -uadmin -p$PSAPASS psa --skip-column-names -Be "select count(*) from sessions;")"
+	fi
+	[ -f /usr/local/cpanel/cpanel ] && echo -e "\n    $(c y <<< "cPanel $(/usr/local/cpanel/cpanel -V) is running.")"
+	[ -f /etc/webmin/miniserv.conf ] && service webmin status | grep -q running && WEBMINPORT=$(grep -E 'port=.*$' /etc/webmin/miniserv.conf | cut -d= -f2) && grep -qE "$WEBMINPORT" <<< "$NSPLNT"  && echo -ne "   $(c y <<< "Webmin is running on port $WEBMINPORT - https://$EXTIP:$WEBMINPORT")"
+	#[ -f /etc/webmin/miniserv.conf ] && $(grep "miniserv" <<< SSPLNT | cut -f2 -d:)
+	#the "u" also gets UDP webmin listener
+	#ss -plntu | grep "miniserv"
+
+	varrpmqa
+	#WEB SERVICES
+	echo -e ""
+	echo -e "\n   $(c p <<< "Default web server (port 80/443):") $(grep -E ":80 |:443 " <<< "$NSPLNT" | awk '{print $4,$7}' | tr '\n' ' ')"
+
+	#SSL HEARTBLEED VULNERABILITY CHECK
+	[[ "$RHVERS" == "6.5" ]] && (rpm -q -changelog openssl | grep -q "CVE-2014-0160" || echo -e "$( c r <<< "--SERVER IS NOT PATCHED FOR OPENSSL HEARTBLEED VULNERABILITY CVE-2014-0160--")")
+
+	[ -f /etc/httpd/conf/httpd.conf ] && service httpd status > /dev/null && echo -ne "\n   $(c p <<< "Apache Processes/Max:") $(pgrep httpd | wc -l)/$(grep -E '^\s*MaxCl' /etc/httpd/conf/httpd.conf|head -n1|awk '{print $2}')"
+	[ -f /etc/init.d/resin ] || [ -d /usr/local/resin ] && echo -e "--> Resin is installed"
+	#nginx (web server, NOT reverse proxy)
+	[ -f  /etc/nginx/nginx.conf ] && grep -qE ":80 .*nginx|:443 .*nginx" <<< "$NSPLNT" && echo -ne "\n   $(c p <<< "Nginx (default webserver) Connections/Max:") $(netstat -anp | grep -c nginx)/$(bc -l <<< "$(grep -rPo '(?<=worker_processes\D )(\d+)' /etc/nginx/*.conf)*$(grep -rPo '(?<=worker_connections\D )(\d+)' /etc/nginx/*.conf)")"
+	#The worker_connections and worker_processes from the main section allows you to calculate max clients you can handle:
+	 #max clients = worker_processes * worker_connections
+	 #In a reverse proxy situation, max clients becomes
+	 #max clients = worker_processes * worker_connections/4 
+	grep -qE ":80 .*java|:443 .*java" <<< "$NSPLNT" && echo -ne "\n   $(c r <<< "Java") $(c p <<< "is the listening web server (port 80/443)")" || grep -qE ":80.*java|:443.*java" <<< "$NSPLNT" && echo -ne "\n   $(c r <<< "Java") $(c p <<< " is listening but not default webserver")"
+
+#PHP
+	PHPVERS=$(sed -rn "s/^php[0-9u-]*common-([0-9a-z.-]+)/\1/p" <<< "$RPMQA");
+	[ -z "$PHPVERS" ] || echo -e "\n   $(c p <<< "PHP-common version:") $PHPVERS"
+
+	echo ""
+	#check if magento: magent
+	#Check if Java (tomcat/catalina) running on port 80 or whatev
+
+	#nginx/varnish presence (port)
+	#MySQL (threads/max_conn) / postgres (port 5432) / memcached (port)
+	if [ -f /etc/my.cnf ]; then  
+		mysck="$(grep -E 'socket' /etc/my.cnf | cut -d= -f2)"
+			if service mysqld status &> /dev/null || service mysql status &> /dev/null || grep -qE ':3306.*mysql' <<< "$NSPLNT"  ; then 
+				if mysqladmin version &> /dev/null; then 
+				echo -e "   $(c p <<< "MySQL (")$(c w  <<< "$(mysqladmin version | sed -rn 's/^Server(.*)\s([.a-zA-Z0-9-]*)$/\2/p')")$(c p <<< ") Processes/Max:")  $(mysql --skip-column-names -Be "show status like 'Threads_connected'" | sed 's/Threads_connected\t*//' || <<< "Error connecting to MySQL.")/$(mysql --skip-column-names -Be "select @@max_connections;")";
+				echo -e "    $(mysqladmin version | grep -E '^Threads' | sed 's/Queries per second avg/Queries per sec/')"
+				else
+					echo -e "\n   $(c y <<< "MySQL running, unable to login. ($(mysql --version | cut -d, -f1)).")"
+				fi
+			else
+				[ -e "$mysck" ] && echo -e "\n   $(c r <<< "MySQL is stopped, but socket ($mysck) exists.")"
+			fi
+	else
+		
+		[ ! -z $(grep "mysql-server" <<< $RPMQA) ] && echo -e "\n   $(c r <<< "MySQL installed, configuration missing (/etc/my.cnf)")"
+	fi
+
+	#GET TOTAL CONNECTIONS TO/FROM A GIVEN PORT
+	echo -e "   $(connct http min)\n   $(connct mysql min)\n   $(connct ssh min)"
+
+	#CHECK FOR POSTGRES
+	grep -qE ":5432.*postmaster" <<< "$NSPLNT" && echo -e "   PostgreSQL is listening on port 5342"
+
+
+
+	#memcached
+	#tcp        0      0 :::11211                    :::*                        LISTEN      3867/memcached  
+
+
+	 #alternatives --display mta | grep current
+	NETMTA=$(grep -m1 -E ":(25\s|587\s|465\s)" <<< "$NSPLNT" | cut -d/ -f2 | sed 's/\s//g'); #NETMTA="$(awk -F/ '/:(25|587)/{print $NF | "sort|uniq"}')" $NSPLNT; 
+	[ -z "$NETMTA" ] || echo -ne "\n   $(c p <<< "MTA:") ";
+	case "$NETMTA" in 
+		xinetd|qmail*) 
+			echo -n "QMAIL ($NETMTA)  $(grep -iq qmhandle <<< "$RPMQA" && echo "qmHandle is available.")"; 
+			;; 
+		master|smtpd) 
+			echo -n "Postfix ($NETMTA)   $(grep -iq pfhandle <<< "$RPMQA" && echo "pfHandle is available.")";
+			#check for simultaneous qmail install when postfix is MTA
+			#[ ! -z "$(grep -i qmail $RPMQA)" ] && echo -e "\n\n$(HWARN "Qmail is installed but Postfix is active MTA. Remove with \n\n   yum remove psa-qmail\n\n")";
+			;; 
+		sendmail)
+			echo -n "Sendmail ($NETMTA)";
+			;;
+		exim)
+			echo -n "Exim ($NETMTA)";
+			;;
+		pmtad)
+			echo -n "PowerMTA ($NETMTA)"
+			;;
+		#strongmail
+	esac; 
+	#echo -e "$MTASTR"
+
+	#Check if Sophos is running/installed
+	if service sav-protect status 2> /dev/null | grep -q "is active"; then
+		echo -ne "\n   $(c p <<< "Sophos is installed and active.")"
+		grep -q "+open" /proc/sys/talpa/intercept-filters/VettingController/ops && echo -e "$(c r <<< " WARNING: Is scanning on file opens")"
+	else 
+		[ -f /etc/init.d/sav-protect ] && echo -e "\n\n   $(c y <<< "Sophos is installed but stopped.")"
+	fi
+	#check for clamav, kaspersky, maldet, etc
+
+
+
+	#Check if Backups running
+	#BKSUSP=$(ps aux | grep -iE '[i]find|[i]Data|[s]impana|[h]olland|[m]ysqldump|[g]zip'); [ ! -z $BKSUSP ] && echo -e "-- BACKUPS ARE RUNNING $BKSUSP--"
+	#ps aufx | awk '/[i]Data|[s]impana|[h]olland|[m]ysqldump|[g]zip/ && !/\/opt\/simpana\/Base|awk/';
+	 #netstat -napt | awk '$5 ~ /:3306/ && $6 == "TIME_WAIT" {print $4,$5}' | sed -r 's/:[0-9]{1,6}//g' | sort |  uniq -c | sort -nr 
+	#CHECK FOR RUNNING BACKUPS
+	echo ""
+	ps x | grep -qEi "[i]find|([m]ysqldump.*holland)|[c]lbackup" && print c r "WARNING: Backups are running."
+	#pstree -lU $(pgrep cvlaunchd) | grep -Ei "[i]find|([g]zip.*mysqldump)|[c]lbackup"
+
+
+	echo -e "\n"
+
+#Filesystem readonly
+	if ! touch /home/rack/ro-test ; then
+		echo "WARNING: FILE SYSTEM IS READ ONLY"
+	else
+		rm -f /home/rack/ro-test
+	fi
+#filesystem disk/inode usage
+	echo -e ". Filesystem Size/Ct Used Avail Use% Mount\nDiskUsage: $(\df -Ph | grep -E "/$")\nInodeUsage: $(\df -Phi | grep -E "/$")" | column -t && echo ""
+	df -Ph | perl -wne 'if(/(\d+)%\s+(.*)/){print "   WARNING: Disk usage on $2 at $1%\n" if $1>90}' | c r && echo ""
+	df -Phi | perl -wne 'if(/(\d+)%\s+(.*)/){print "   WARNING: Disk inode usage on $2 at $1%\n" if $1>90}' | c r && echo -e "\n"
+
+
+	#Check disk statuses:
+	#omreport storage pdisk controller=0 | grep "Status                    : Ok"
+
+
+	free -om
+	#processor count
+	echo -e "\n$(c c <<< "CPU:") $(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2) / $(grep -c "processor" /proc/cpuinfo) cores" #grep -Em2 "cpu MHz|model name" /proc/cpuinfo
+		echo -e "$(c c <<< "CPU Mhz:")$(grep 'cpu MHz' /proc/cpuinfo | sed -rn 's/cpu MHz\s*:\s*([0-9.]+).*$/\1/p' | sort -nr | uniq -c | sed -r 's/([0-9]+)\s+([0-9]+)/\1 x \2/g' | tr '\n' ' ' )"
+		if lsmod | grep -q cpufreq && [ -f "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor" ]; then
+			echo -e "$(c c <<< "CPU Governor:") $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor  | uniq 2> /dev/null)"
+
+			#CHECK FOR CPU THROTTLING: http://www.servernoobs.com/avoiding-cpu-speed-scaling-in-modern-linux-distributions-running-cpu-at-full-speed-tips/#
+			#check the current scaling governor, ensure that all gov's for all cores match and are performance
+			if [[ $(grep performance /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | wc -l 2> /dev/null) != $(grep -c "processor" /proc/cpuinfo) ]] ; then
+				#echo -e "\n----- CPU SCALING IS ACTIVE -----"
+
+				#cpuspeed running and/or is set to start?
+				service cpuspeed status 2> /dev/null | grep -iv performance
+				chkconfig --list cpuspeed | grep on
+				#grep -ivh performance /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | uniq
+				#cpu is being throttled (ondemand)?
+				#pgrep -f kondemand > /dev/null
+				#echo -e "CPU Governor: $(grep -hv -m1 performance /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | head -1)"
+
+				#'FIX' WITH (in /etc/rc.local):
+				#if grep -qi performance /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors; then for CPUFREQ in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f $CPUFREQ ] || continue; echo -n performance > $CPUFREQ; done; fi
+				#OR if cpuspeed is available and performance governor is not enabled write it to config and restart cpuspeed:
+				#service cpuspeed status 2> /dev/null | grep -iv performance && [ -f /etc/sysconfig/cpuspeed ] && echo "GOVERNOR=performance" >> /etc/sysconfig/cpuspeed && service cpuspeed restart && chkconfig cpuspeed on
+				#echo -e "-----\n"
+			fi
+		fi
+	#CHECK FOR cSTATES BEING ACTIVE - Dell processor throttling
+	#omreport chassis biossetup |  grep -i 'state'  # SHOULD BE "C States                                          : Disabled"
+
+
+	#CHECK FOR RUNNING BACKUPS
+	#ps x | grep -Ei "[i]find|([g]zip.*mysqldump)|[c]lbackup"
+	#pstree -lU $(pgrep cvlaunchd) | grep -Ei "[i]find|([g]zip.*mysqldump)|[c]lbackup"
+
+}
+#grep -E '^model name|^cpu MHz' /proc/cpuinfo
+#CAN USE OMREPORT IF AVAILABLE TO GET PROCESSOR INFO
+#omreport chassis processors
+
+omrep() {
+	case $1 in
+	raid|storage)
+		for i in "$(omreport storage controller  | awk '$1 == "ID" {print $3}')"; do
+			grep -iE "^(list|id|name|state|status|progress|layout|size|device name)" <<< "$(omreport storage pdisk controller=0)"
+		done
+		grep -iE "^(list|id|name|state|status|progress|layout|size|device name)" <<< "$(omreport storage vdisk; omreport storage battery)" | sed -r "s/^(List.+|ID.+)/\n\1/g"
+		
+	;;
+	ram|memory)
+		omreport chassis memory
+	;;
+	cpu|processors)
+		omreport chassis processors
+		omreport chassis biossetup |  grep -i 'state'
+	;;
+	esac
+}
+
+bigdu () {
+	#df -ivh $PWD
+	#df -hv $PWD
+
+
+	echo -e "\n\n\n$(date)\nDisk Usage for directory: $PWD\n"; 
+	#echo -e "_ Filesystem Size/Ct Used Avail Use% Mount\nDiskUsage: $(\df -Ph | grep -E "/$")\nInodeUsage: $(\df -Phi | grep -E "/$")" | column -t
+	echo -e ". Filesystem Size/Ct Used Avail Use% Mount\nDiskUsage: $(\df -Ph $PWD | tail -1)\nInodeUsage: $(\df -Phi $PWD | tail -1)" | column -t
+
+	echo -e "\nLargest Directories:" ; du -bx --max-depth=5 $PWD 2>/dev/null | grep -vEi ".*/$" | awk '$1 > 10^9 {print}' | sort -grk 1 | head -30 | awk 'BEGIN{FS=OFS="\t"} {if ($1<=10^9) { fsize=$1/10^6; pow="MB"; } else if( $1>10^9 ) { fsize=$1/10^9; pow="GB"; } ; printf "\t%5.2f%s%s", fsize, pow,"\t"$2"\n"}' 
+	echo -e "\nLargest Files:"; find $PWD -mount -type f -print0 2>/dev/null| xargs -0 du -bx | sort -nrk1 | head -30 | awk 'BEGIN{FS=OFS="\t"} {if ($1<=10^9) { fsize=$1/10^6; pow="MB"; } else if( $1>10^9 ) { fsize=$1/10^9; pow="GB"; } printf "\t%5.1f%2s\t%s\n", fsize , pow, $2 }'
+
+	#INODE COUNT
+	#ls -UA -1 | wc -l 
+}
+
+#QC/triage STEPS:
+#hr △
+#hr ✭
+echo "Gathering server details . . ."
+hr m "░"
+
+case $1 in
+du)
+	#exec "curl -sS http://pub.rackerspace.com/scripts/serverinf_stats"
+	bigdu
+;;
+qc)
+	serverinf
+	echo -e "DISK FREE:\n$(df -ThP | column -t | (read -r; printf "%s\n" "$REPLY"; sort -k1))\n\nNETSTAT: $(netstat -plnt)\n\nINTERFACES:\n$(ifconfig)\n\nROUTES:\n$(route)\n\nCHKCONFIG:\n$(chkconfig --list)\n\n REPOLIST:\n$(yum repolist | sed -n '/repo id/,$p')\n\n UPDATES: $(yum check-update --disableexcludes=all)"
+;;
+prep)
+	case $2 in
+	pre|preflight)
+		echo "Prep preflight"
+	;;
+	post|after)
+		echo "Post-reboot check"
+	;;
+	esac
+;;
+mem|memory|cpu)
+	tempfile=$(mktemp)
+	coproc sar -B -r -o $tempfile 1 10 >/dev/null
+	resize
+	clear
+	echo "== Server Time: =="
+		date '+%F %r'
+	echo -e "\n== Memory Utilization Information: =="
+		awk '{ if ($1 == "MemTotal:") { TOTAL =$2/1024} if ($1 == "MemFree:") { FREE =$2 } if ($1== "Buffers:") { BUFFERS =$2 } if ($1 == "Cached:" ) { CACHE = $2 } USED = TOTAL-(FREE+BUFFERS+CACHE)/1024 } END {printf "Total Memory\tActive Memory\tPercentage Used\n%dM\t\t%dM\t\t%.2f%%\n",TOTAL,USED,USED/TOTAL * 100; }' /proc/meminfo
+	echo -e "\n== Current Swap Usage: =="
+		swapon -s | sed 1d | awk 'BEGIN { print "DEVICE\t\tUSED\t\tTOTAL\t\tPERCENT USED"; } { DEVICE=$1; TOTAL=($3/1024); USED=($4/1024); PERCENT=((USED/TOTAL)*100); printf "%s\t%.2fM\t%.2fM\t%.2f%%\n",DEVICE,USED,TOTAL,PERCENT; }' | column -s$'\t' -t
+	echo -e "\n== Top 10 Processes by Memory Usage: =="
+		ps -eo user,pid,%mem,rsz,args --sort=-rsz | head -11 | awk '{print $1,$2,$3,$4,$5}' | column -t
+	echo -e "\n== Top 5 Processes By CPU Usage: =="
+		top -b -n 1 | awk 'NR>6 && NR<13 {printf "%6s %-4s %-4s %-s\n",$1,$2,$9,$NF}'
+	echo -e "\n== Top 10 Processes by Memory Usage: =="
+		( printf "%s\t%s\t%s\n" "PID" "PROCESS" "SWAP"
+		(for i in /proc/[0-9]*;
+			do PID=${i#/proc/};
+				NAME=$(awk '/Name/ {print $2}' ${i}/status 2>/dev/null);
+				SWAP=$(awk '/Swap/ { sum+=$2 }; END { print sprintf("%.2f", sum/1024) "M" }' /${i}/smaps 2>/dev/null);
+				echo ${PID} ${NAME} ${SWAP};
+			done | awk '!/0.00M/' |sort -grk3,3 | head -10)) | column -t
+	echo -e "\n== Top 10 Kernel Slab Caches: =="
+		( echo "SIZE NAME"; slabtop -o -s c | sed 1,7d | head -10 | awk '{ printf "%.2fM\t%s\n",gensub(/K$/,"","g",$(NF-1))/1024,$NF; }' ) | column -t
+	echo -e "\n== Last 30 Minutes Memory Usage: =="
+		sar -r -s $(date --date='-50 minutes' +%T) | sed 1,2d
+	echo -e "\n== Last 30 Minutes Paging/Swap Statistics: =="
+		sar -B -s $(date --date='-50 minutes' +%T) | sed 1,2d; wait 2>/dev/null
+	echo -e "\n== Current 1 Second Memory Usage Statistics (10 Count): =="
+		sar -r -f $tempfile | sed 1,2d
+	echo -e "\n== Current 1 Second Paging/Swap Statistics (10 Count): =="
+		sar -B -f $tempfile | sed 1,2d
+		if [[ -f $tempfile ]]; then 
+			rm -f $tempfile
+		fi
+;;
+vhost)
+
+	VHOSTSTR=$(httpd -S 2>&1 | grep "$2" | gawk '{if (match($0,/\((.*)\)/,f)) print f[1]}') && VHOSTFILE=$(echo $VHOSTSTR | awk '{split($0,a,":"); print a[1]}') && VHOSTLN=$(echo $VHOSTSTR | awk '{split($0,a,":"); print a[3]}')
+;;
+plesk)
+	#serverinf
+	#bash <(curl -sS http://pub.rackerspace.com/scripts/pleskupgradetriage) $2
+	echo -e "Please use the updated Plesk triage tool\n\n  bash <(curl -sS http://pub.rackerspace.com/scripts/plesktool) triage [bb]"
+;;
+connct|connections|conns)
+	echo -e "\n\n$(connct $2 $3)\n\n"
+;;
+portct|ports|port)
+	bash <(curl -sS http://pub.rackerspace.com/scripts/security) port
+
+
+;;
+brute)
+	ip
+	#varsysinf
+	
+	#GET BASIC DETAILS
+	PRIMIP="$(head -1 <<< "$INTIP")"
+	[[ "$EXTIP" != "$PRIMIP" ]] && PRIMIP="Server is behind HW firewall: $PRIMIP <=> $EXTIP" || PRIMIP="$PRIMIP"
+	echo "$PRIMIP"
+	bash <(curl -sS http://pub.rackerspace.com/scripts/security) $2
+
+	#SSH
+	echo -e "\n\n"
+	service fail2ban status &>1 /dev/null && echo "Fail2Ban is running" || echo "Fail2Ban is not running."
+	#netstat -panT | grep :22 | sort -k6
+
+	#proftp failed attempts
+	#sed -nr "s/(.)+proftpd(.)+\[([0-9.]+)\](.)*no such user found from (.)* to (.)*/\3/p" /var/log/secure | sort | uniq -c | sort -nr
+	#grep -E "(.)+proftpd(.)+\[([0-9.]+)\](.)*(no such user found from|Login failed) (.)* to (.)*" /var/log/secure | awk '{print $16}' | sort | uniq -c
+
+
+;;
+ip)
+	ip
+	echo -e "$EXTIP <=> $INTIP"
+;;
+swap)
+	echo
+	swaplist
+;;
+omreport)
+	omrep $2
+;;
+help|--help|-h)
+	echo -e ""
+	echo -e "Server Overview and Triage v.$SCRVERSION\nUsage:"
+	echo -e " - General server overview\n\tbash -i <(curl -sS http://pub.rackerspace.com/scripts/serverinf)\n"
+	echo -e " - Specific server info\n\tbash -i <(curl -sS http://pub.rackerspace.com/scripts/serverinf) [du|qc|plesk [bb]|connct [http|mysql|ssh]|portct|brute [ssh|pop]|help]"
+	echo -e ""
+;;
+*)
+	serverinf
+;;
+esac
+#hr ▽
+hr m ░
+echo -ne "\n\n"
+
